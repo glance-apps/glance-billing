@@ -1,6 +1,6 @@
 {
   "name": "@glance-apps/billing",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shared entitlement engine and store-billing adapters for the GLANCE family of apps (Play Billing, StoreKit/RevenueCat, Electron/RevenueCat REST)",
   "license": "MIT",
   "type": "module",

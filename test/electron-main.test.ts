@@ -39,7 +39,15 @@ vi.mock('electron', () => ({
     getReceiptURL: () => (H.receiptQueue.length ? H.receiptQueue.shift()! : H.receiptURL),
     canMakePayments: () => H.canMakePayments,
     getProducts: async () => H.products,
-    on: (ev: string, fn: (...args: unknown[]) => unknown) => H.iapListeners.set(ev, fn),
+    on: (ev: string, fn: (...args: unknown[]) => unknown) => {
+      // Model real Electron: `inAppPurchase` only exists on macOS. Off-darwin it
+      // is undefined, so touching `.on` throws — the Windows launch crash. The
+      // registration must never reach this call unless the platform is darwin.
+      if (process.platform !== 'darwin') {
+        throw new TypeError("Cannot read properties of undefined (reading 'on')");
+      }
+      H.iapListeners.set(ev, fn);
+    },
     purchaseProduct: async () => true,
     restoreCompletedTransactions: () => {},
     finishTransactionByDate: () => {},
@@ -153,6 +161,36 @@ describe('parseEntitlement', () => {
 
 describe('channel gating', () => {
   it('non-MAS build (no receipt): active immediately, RevenueCat never called', async () => {
+    const m = await freshModule();
+    m.registerElectronBilling(fakeWindow, OPTS);
+    expect(await statusViaIpc()).toEqual({ active: true, productId: null });
+    expect(H.fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('non-darwin startup — Windows launch crash guard', () => {
+  it('registerElectronBilling does not throw off-darwin (StoreKit observer skipped)', async () => {
+    // Off macOS Electron does not expose `inAppPurchase`, so registering the
+    // 'transactions-updated' observer throws and crashes the host app at
+    // launch. Registration must be crash-free on every non-darwin platform.
+    for (const platform of ['win32', 'linux']) {
+      H.handlers.clear();
+      H.iapListeners.clear();
+      Object.defineProperty(process, 'platform', { value: platform });
+      const m = await freshModule();
+      expect(() => m.registerElectronBilling(fakeWindow, OPTS)).not.toThrow();
+      // The observer is macOS-only; it must not have been registered.
+      expect(H.iapListeners.has('transactions-updated')).toBe(false);
+      // The four subscription:* IPC handlers are still wired up.
+      expect(H.handlers.has('subscription:status')).toBe(true);
+      expect(H.handlers.has('subscription:prices')).toBe(true);
+      expect(H.handlers.has('subscription:purchase')).toBe(true);
+      expect(H.handlers.has('subscription:restore')).toBe(true);
+    }
+  });
+
+  it('subscription:status returns the free-build value off-darwin without calling RevenueCat', async () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
     const m = await freshModule();
     m.registerElectronBilling(fakeWindow, OPTS);
     expect(await statusViaIpc()).toEqual({ active: true, productId: null });
