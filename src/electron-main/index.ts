@@ -334,43 +334,52 @@ export function registerElectronBilling(window: BrowserWindow, options: Electron
   }
 
   // StoreKit transaction observer — registered once for the lifetime of the
-  // process. Cast needed because Electron's inAppPurchase typings declare the
-  // listener as () => void but the runtime passes (event, transactions[])
-  // matching the Electron docs.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  inAppPurchase.on('transactions-updated', (async (_event: any, transactions: Electron.Transaction[]) => {
-    for (const t of transactions) {
-      if (t.transactionState === 'purchased' || t.transactionState === 'restored') {
-        // Apple itself confirmed this transaction — that is authoritative proof
-        // of purchase for a lifetime product, independent of RevenueCat
-        // bookkeeping.
-        if (t.payment.productIdentifier === o.products.lifetime) latchLifetime(o, 'storekit-transaction');
-        const s = await fetchEntitlementStatus(o); // posts receipt to RC (bookkeeping/alias)
-        fireBillingEvent({
-          status: 'success',
-          code: 0,
-          message: 'ok',
-          productId: t.payment.productIdentifier,
-        });
-        if (t.transactionState === 'restored') {
-          // A restored transaction is proof the user owns something; don't let
-          // a failed RC read turn a successful Apple restore into "nothing
-          // restored".
-          settleRestore(s.active || isLifetimeLatched(o), s.productId ?? t.payment.productIdentifier);
+  // process. StoreKit only exists on macOS: off-darwin Electron does not expose
+  // `inAppPurchase` (it is undefined), so calling `.on` here throws and takes
+  // down the host app at startup — the Windows launch crash this guard fixes.
+  // Every other inAppPurchase access in this module is already platform-guarded
+  // (getProducts above, the purchase/restore handlers below), and the four
+  // subscription:* handlers return correct free-build values off macOS, so
+  // skipping the observer off-darwin loses nothing.
+  // Cast needed because Electron's inAppPurchase typings declare the listener
+  // as () => void but the runtime passes (event, transactions[]) matching the
+  // Electron docs.
+  if (process.platform === 'darwin') {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    inAppPurchase.on('transactions-updated', (async (_event: any, transactions: Electron.Transaction[]) => {
+      for (const t of transactions) {
+        if (t.transactionState === 'purchased' || t.transactionState === 'restored') {
+          // Apple itself confirmed this transaction — that is authoritative proof
+          // of purchase for a lifetime product, independent of RevenueCat
+          // bookkeeping.
+          if (t.payment.productIdentifier === o.products.lifetime) latchLifetime(o, 'storekit-transaction');
+          const s = await fetchEntitlementStatus(o); // posts receipt to RC (bookkeeping/alias)
+          fireBillingEvent({
+            status: 'success',
+            code: 0,
+            message: 'ok',
+            productId: t.payment.productIdentifier,
+          });
+          if (t.transactionState === 'restored') {
+            // A restored transaction is proof the user owns something; don't let
+            // a failed RC read turn a successful Apple restore into "nothing
+            // restored".
+            settleRestore(s.active || isLifetimeLatched(o), s.productId ?? t.payment.productIdentifier);
+          }
+          inAppPurchase.finishTransactionByDate(t.transactionDate);
+        } else if (t.transactionState === 'failed') {
+          const cancelled = t.errorCode === 2; // SKErrorPaymentCancelled
+          fireBillingEvent({
+            status: cancelled ? 'cancelled' : 'error',
+            code: t.errorCode ?? 0,
+            message: cancelled ? 'User cancelled' : (t.errorMessage ?? 'Transaction failed'),
+            productId: t.payment.productIdentifier,
+          });
+          inAppPurchase.finishTransactionByDate(t.transactionDate);
         }
-        inAppPurchase.finishTransactionByDate(t.transactionDate);
-      } else if (t.transactionState === 'failed') {
-        const cancelled = t.errorCode === 2; // SKErrorPaymentCancelled
-        fireBillingEvent({
-          status: cancelled ? 'cancelled' : 'error',
-          code: t.errorCode ?? 0,
-          message: cancelled ? 'User cancelled' : (t.errorMessage ?? 'Transaction failed'),
-          productId: t.payment.productIdentifier,
-        });
-        inAppPurchase.finishTransactionByDate(t.transactionDate);
       }
-    }
-  }) as unknown as () => void);
+    }) as unknown as () => void);
+  }
 
   // Fetch current entitlement status. Non-MAS builds (Developer ID / GitHub
   // distribution) have no App Store receipt and are free by design — skip RC.
