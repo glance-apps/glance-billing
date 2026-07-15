@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    # The tests mock Electron, so CI never launches it — skip the ~100MB
+    # binary download to keep installs fast.
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # No package-lock.json is committed (it is gitignored), so `npm ci` — which
+      # requires a lockfile — is not usable here. `npm install` also runs the
+      # `prepare` script, which builds dist/.
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      # Guard against source/artifact drift: this package publishes the committed
+      # dist/ (package.json main/exports point at it), so a stale dist ships wrong
+      # code even when src is correct. Fail the build if the freshly compiled
+      # output differs from what was committed.
+      - name: Verify committed dist/ is up to date
+        run: |
+          if ! git diff --exit-code -- dist; then
+            echo "::error::dist/ is out of sync with src/. Run 'npm run build' and commit the updated dist/."
+            exit 1
+          fi
+
+      - name: Test
+        run: npm test
