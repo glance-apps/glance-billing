@@ -133,7 +133,22 @@ the `ElectronBillingApi` shape (see `adapters/electron-renderer.ts`).
 1. Add the plugin project from `node_modules/@glance-apps/billing/android` to
    your Capacitor Android build (settings.gradle include + register the
    `BillingBridgePlugin` in your `MainActivity`).
-2. Construct the adapter:
+2. Set the Play Billing Library version in your `variables.gradle`. As of
+   v0.2.0 the plugin targets **Google Play Billing Library 8** (Google
+   requires 8+ for all Play app updates from Aug 31, 2026); the plugin's own
+   fallback is `8.3.0`, but pin it explicitly in your app:
+
+```groovy
+// variables.gradle
+ext {
+    playBillingVersion = '8.3.0'
+}
+```
+
+   Do not set a 7.x version here — the plugin uses the Billing 8
+   `queryProductDetailsAsync` callback signature and will not compile
+   against 7.x.
+3. Construct the adapter:
 
 ```ts
 import { registerPlugin } from '@capacitor/core';
@@ -148,7 +163,7 @@ const adapter = Capacitor.isNativePlatform()
   : null;
 ```
 
-3. Gate your app on `isUnlocked`, render your paywall from `prices` /
+4. Gate your app on `isUnlocked`, render your paywall from `prices` /
    `trialEligible` / `trialDays`, and wire `subscribe` / `restore` /
    the reviewer-code input.
 

@@ -1,7 +1,7 @@
 ext {
     junitVersion = project.hasProperty('junitVersion') ? rootProject.ext.junitVersion : '4.13.2'
     androidxAppCompatVersion = project.hasProperty('androidxAppCompatVersion') ? rootProject.ext.androidxAppCompatVersion : '1.7.0'
-    playBillingVersion = project.hasProperty('playBillingVersion') ? rootProject.ext.playBillingVersion : '7.1.1'
+    playBillingVersion = project.hasProperty('playBillingVersion') ? rootProject.ext.playBillingVersion : '8.3.0'
 }
 
 buildscript {

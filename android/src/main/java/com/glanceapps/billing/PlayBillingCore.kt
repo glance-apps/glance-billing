@@ -217,9 +217,9 @@ class PlayBillingCore(context: Context) {
             .build()
 
         scope.launch {
-            billingClient.queryProductDetailsAsync(subsParams) { result, detailsList ->
+            billingClient.queryProductDetailsAsync(subsParams) { result, queryResult ->
                 if (result.responseCode != BillingClient.BillingResponseCode.OK) return@queryProductDetailsAsync
-                for (details in detailsList) {
+                for (details in queryResult.productDetailsList) {
                     if (details.productId != yearly) continue
                     val offerDetails = details.subscriptionOfferDetails ?: continue
                     val price = offerDetails
@@ -237,9 +237,9 @@ class PlayBillingCore(context: Context) {
                     editor.apply()
                 }
             }
-            billingClient.queryProductDetailsAsync(inappParams) { result, detailsList ->
+            billingClient.queryProductDetailsAsync(inappParams) { result, queryResult ->
                 if (result.responseCode != BillingClient.BillingResponseCode.OK) return@queryProductDetailsAsync
-                for (details in detailsList) {
+                for (details in queryResult.productDetailsList) {
                     val price = details.oneTimePurchaseOfferDetails?.formattedPrice ?: continue
                     if (details.productId == lifetime) prefs.edit().putString(KEY_PRICE_LIFETIME, price).apply()
                 }
@@ -283,15 +283,15 @@ class PlayBillingCore(context: Context) {
             .build()
 
         scope.launch {
-            billingClient.queryProductDetailsAsync(params) { result, detailsList ->
-                logd("launchPurchaseFlow($productId): query code=${result.responseCode} count=${detailsList.size}")
+            billingClient.queryProductDetailsAsync(params) { result, queryResult ->
+                logd("launchPurchaseFlow($productId): query code=${result.responseCode} count=${queryResult.productDetailsList.size}")
 
                 if (result.responseCode != BillingClient.BillingResponseCode.OK) {
                     Log.w(TAG, "launchPurchaseFlow($productId): query failed (exit A) code=${result.responseCode}")
                     onBillingEvent?.invoke("error", result.responseCode, result.debugMessage, productId)
                     return@queryProductDetailsAsync
                 }
-                val details = detailsList.firstOrNull() ?: run {
+                val details = queryResult.productDetailsList.firstOrNull() ?: run {
                     Log.w(TAG, "launchPurchaseFlow($productId): empty detailsList (exit B)")
                     onBillingEvent?.invoke("error", BillingClient.BillingResponseCode.ITEM_UNAVAILABLE, "product_not_found", productId)
                     return@queryProductDetailsAsync
