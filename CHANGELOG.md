@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.1 — 2026-07-28
+
+### Android build config: Kotlin Gradle plugin 2.0.21 → 2.2.20
+
+Build config only — no source or API changes.
+
+billing-ktx 8.3.0 (the plugin's Play Billing dependency since 0.2.0) is
+compiled with Kotlin 2.2 metadata and pulls in kotlin-stdlib 2.2.10. A
+Kotlin 2.0.x compiler cannot read 2.2 metadata and crashes
+`compileReleaseKotlin` with an internal
+`IllegalArgumentException: source must not be null`. The module's Kotlin
+Gradle plugin pin is now 2.2.20, matching the consuming apps' toolchain.
+
+The AGP classpath stays at 8.7.2 — within KGP 2.2.20's supported AGP range
+(7.3.1–8.11.1). `jvmTarget = 17` and `compileSdk 35` fallbacks are
+unchanged and fully supported by Kotlin 2.2.
+
 ## 0.2.0 — 2026-07-28
 
 ### Breaking: Android plugin migrated to Google Play Billing Library 8
