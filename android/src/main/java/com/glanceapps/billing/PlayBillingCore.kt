@@ -24,7 +24,7 @@ import kotlin.coroutines.resume
 /**
  * Google Play Billing core for GLANCE apps, decoupled from any single app:
  * product IDs are injected via [configure], and results are cached in this
- * module's own SharedPreferences so the JS-facing plugin can answer instantly.
+ * module's own [BillingStore] so the JS-facing plugin can answer instantly.
  *
  * Ported from a production Play Billing integration. Load-bearing details,
  * each of which was tuned or fixed against real Play behavior — preserve them:
@@ -38,6 +38,8 @@ import kotlin.coroutines.resume
  * - queryPurchases checks SUBS first, then INAPP — an active subscription
  *   wins over a stale one-time record.
  * - Purchases must be acknowledged or Play refunds them after three days.
+ *   A failed ack is persisted and retried by [AckRetryWorker]; entitlement is
+ *   never gated on the outcome.
  * - consumeTestPurchase queries INAPP directly rather than trusting the
  *   cached token: when an annual test subscription is active the cached token
  *   is the SUBS token (SUBS has priority), which would leave the lifetime
@@ -45,22 +47,56 @@ import kotlin.coroutines.resume
  *
  * The annual plan must be a Play SUBS product; the lifetime plan an INAPP
  * (one-time) product.
+ *
+ * ── Lifecycle ────────────────────────────────────────────────────────────
+ *
+ * [connect] is called from the plugin's `handleOnStart` on EVERY foreground
+ * and is idempotent; [destroy] is called from `handleOnDestroy` and nowhere
+ * else. Nothing happens on `handleOnStop` beyond dropping the activity
+ * reference — the connection is deliberately kept alive across backgrounding.
+ * A BillingClient is dead forever after endConnection() (device-confirmed:
+ * "Client was already closed and can't be reused"), and the old
+ * close-on-onStop lifecycle left every billing operation in the process
+ * silently no-opping after the first background/foreground cycle.
+ *
+ * The shared client lives behind [client], the single accessor that replaces
+ * a CLOSED instance before handing anything out (decision table in
+ * [BillingConnectionPolicy]) — reuse of a closed client is impossible by
+ * construction, not avoided by convention. [AckRetryWorker] deliberately does
+ * NOT go through this accessor: its retry lane owns a short-lived client per
+ * attempt precisely so it never depends on the shared instance's lifecycle.
+ *
+ * ── Why this class holds an application context ──────────────────────────
+ *
+ * DELIBERATE, and different from the app-side implementation this was ported
+ * from. Capacitor's `Plugin.getContext()` returns the BridgeActivity, and a
+ * plugin-scoped object outlives that activity: neither consuming app declares
+ * `android:configChanges`, so every rotation, dark-mode toggle, locale change,
+ * font-size change and multi-window resize destroys the activity and builds a
+ * new Bridge, plugin and core. The BillingClient, the SharedPreferences
+ * handle and every WorkManager enqueue therefore take [appContext], never the
+ * activity. Holding the activity here would leak one per recreation — quietly,
+ * with no crash and nothing in logcat, which is exactly why it is called out
+ * rather than left to be inferred.
+ *
+ * [activity] is the one deliberate exception: it is needed to launch the Play
+ * sheet, is set on foreground and cleared on background, and is never used to
+ * build anything long-lived.
  */
 class PlayBillingCore(context: Context) {
 
     companion object {
         private const val TAG = "GlanceBilling"
-        private const val PREFS = "glance_billing_cache"
-        private const val KEY_ACTIVE = "subscription_active"
-        private const val KEY_PRODUCT_ID = "subscription_product_id"
-        private const val KEY_TOKEN = "subscription_token"
-        private const val KEY_PRICE_ANNUAL = "price_annual"
-        private const val KEY_PRICE_LIFETIME = "price_lifetime"
-        private const val KEY_TRIAL_ELIGIBLE = "trial_eligible_annual"
-        private const val KEY_TRIAL_DAYS = "trial_days_annual"
     }
 
-    private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    /**
+     * Application context — see the class header. Everything long-lived
+     * (client, store, WorkManager) is built from this, never from the
+     * BridgeActivity the plugin hands in.
+     */
+    private val appContext: Context = context.applicationContext
+
+    private val store = BillingStore(appContext)
     private val scope = CoroutineScope(Dispatchers.IO)
 
     var activity: Activity? = null
@@ -105,10 +141,47 @@ class PlayBillingCore(context: Context) {
         }
     }
 
-    private val billingClient: BillingClient = BillingClient.newBuilder(context)
-        .setListener(purchasesUpdatedListener)
-        .enablePendingPurchases(PendingPurchasesParams.newBuilder().enableOneTimeProducts().build())
-        .build()
+    /**
+     * The ONLY reference to the shared BillingClient, and it is never touched
+     * directly — every use goes through [client]. Lazily built, so a core that
+     * is constructed but never configured (the plugin builds one in `load()`,
+     * before JS calls initialize) never constructs a client either.
+     */
+    private var billingClient: BillingClient? = null
+
+    /**
+     * Single accessor for the shared client. Consults
+     * [BillingConnectionPolicy.clientAction]: a CLOSED instance (dead forever,
+     * per Play's documentation and the device-confirmed warning) is replaced
+     * with a fresh one before anything is handed out, which makes the closed
+     * object unreachable. Synchronized because billing entry points span the
+     * main thread (handleOnStart/handleOnDestroy) and the WebView's JS thread
+     * (the plugin's @PluginMethod calls).
+     *
+     * A fresh instance starts DISCONNECTED and holds no service binding until
+     * startConnection — so an accessor hit after [destroy] (e.g. a late JS
+     * bridge call during teardown) creates only an inert object, never a leak.
+     */
+    @Synchronized
+    private fun client(): BillingClient {
+        val held = billingClient
+        if (held != null &&
+            BillingConnectionPolicy.clientAction(held.connectionState) ==
+                BillingConnectionPolicy.ClientAction.REUSE
+        ) {
+            return held
+        }
+        val fresh = BillingClient.newBuilder(appContext)
+            .setListener(purchasesUpdatedListener)
+            .enablePendingPurchases(PendingPurchasesParams.newBuilder().enableOneTimeProducts().build())
+            // PBL 8: service drops (Play killing the binding while we hold the
+            // client) reconnect themselves instead of waiting for the next
+            // foreground connect().
+            .enableAutoServiceReconnection()
+            .build()
+        billingClient = fresh
+        return fresh
+    }
 
     fun configure(yearly: String, lifetime: String, enableDebugLogging: Boolean) {
         yearlyProductId = yearly
@@ -120,65 +193,126 @@ class PlayBillingCore(context: Context) {
 
     // ── Cached state (read by the plugin on the JS thread — always fast) ──────
 
-    val cachedActive: Boolean get() = prefs.getBoolean(KEY_ACTIVE, false)
-    val cachedProductId: String? get() = prefs.getString(KEY_PRODUCT_ID, null)
-    val cachedPriceAnnual: String? get() = prefs.getString(KEY_PRICE_ANNUAL, null)
-    val cachedPriceLifetime: String? get() = prefs.getString(KEY_PRICE_LIFETIME, null)
-    val cachedTrialEligible: Boolean get() = prefs.getBoolean(KEY_TRIAL_ELIGIBLE, true)
-    val cachedTrialDays: Int get() = prefs.getInt(KEY_TRIAL_DAYS, -1)
+    val cachedActive: Boolean get() = store.subscriptionActive
+    val cachedProductId: String? get() = store.subscriptionProductId
+    val cachedPriceAnnual: String? get() = store.priceAnnual
+    val cachedPriceLifetime: String? get() = store.priceLifetime
+    val cachedTrialEligible: Boolean get() = store.trialEligibleAnnual
+    val cachedTrialDays: Int get() = store.trialDaysAnnual
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    /**
+     * Idempotent foreground connect — called from the plugin's `handleOnStart`
+     * on every foreground. [BillingConnectionPolicy.connectAction] decides: a
+     * live connection skips straight to the queries (keep-alive), an in-flight
+     * connection is left to finish (its setup callback runs the queries), and
+     * only a disconnected client actually starts a connection.
+     *
+     * Either path ends with [queryPurchases] running on THIS foreground. That
+     * is not belt-and-braces: under keep-alive the client stays connected
+     * across backgrounding, so onBillingSetupFinished no longer fires per
+     * foreground. Without the already-connected path running the queries
+     * itself, the fix would trade "billing dead after backgrounding" for
+     * "billing alive but never refreshing" — which passes a naive logcat
+     * check and still breaks restores, entitlement refresh and the
+     * re-acknowledgement lane.
+     */
     fun connect() {
-        billingClient.startConnection(object : BillingClientStateListener {
-            override fun onBillingSetupFinished(result: BillingResult) {
-                if (result.responseCode == BillingClient.BillingResponseCode.OK) {
-                    queryPurchases()
-                    queryProductPrices()
-                }
+        val client = client()
+        when (BillingConnectionPolicy.connectAction(client.connectionState)) {
+            BillingConnectionPolicy.ConnectAction.ALREADY_CONNECTED -> {
+                queryPurchases()
+                queryProductPrices()
             }
-            override fun onBillingServiceDisconnected() {
-                // Play retries automatically; we reconnect on the next connect() call.
+            BillingConnectionPolicy.ConnectAction.WAIT -> {
+                // startConnection already in flight; its onBillingSetupFinished
+                // will run the queries. Stacking another does nothing useful.
             }
-        })
+            BillingConnectionPolicy.ConnectAction.CONNECT -> {
+                client.startConnection(object : BillingClientStateListener {
+                    override fun onBillingSetupFinished(result: BillingResult) {
+                        if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                            queryPurchases()
+                            queryProductPrices()
+                        }
+                    }
+                    override fun onBillingServiceDisconnected() {
+                        // enableAutoServiceReconnection re-establishes the
+                        // service connection on this same instance; the next
+                        // handleOnStart's connect() is the backstop.
+                    }
+                })
+            }
+        }
     }
 
-    fun disconnect() {
-        billingClient.endConnection()
+    /**
+     * Final teardown for THIS core instance — the plugin's `handleOnDestroy`
+     * only, never `handleOnStop`. Required, not cleanup: neither consuming app
+     * declares `android:configChanges`, so the activity is recreated on every
+     * rotation, dark-mode toggle, locale change, font-size change and
+     * multi-window resize, and each recreation builds a new Bridge, plugin and
+     * core. The old binding used to be released by onStop's disconnect purely
+     * by accident; without this, every recreation would leak a binding — in
+     * ordinary use, not in an edge case.
+     *
+     * Under the accessor invariant each client is closed at most once, and
+     * only here — which is also why the "Receiver is not registered" warning
+     * (a second endConnection on an already-closed client) should never
+     * appear. Deliberately does not construct: closing nothing is fine.
+     */
+    @Synchronized
+    fun destroy() {
+        billingClient?.endConnection()
+        billingClient = null
+        activity = null
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
 
-    private suspend fun queryPurchasesForType(productType: String): List<Purchase> =
+    private suspend fun queryPurchasesForType(client: BillingClient, productType: String): List<Purchase> =
         suspendCancellableCoroutine { cont ->
-            billingClient.queryPurchasesAsync(
+            client.queryPurchasesAsync(
                 QueryPurchasesParams.newBuilder().setProductType(productType).build()
             ) { _, purchases -> cont.resume(purchases) }
         }
 
     fun queryPurchases() {
-        if (!billingClient.isReady) return
+        val client = client()
+        if (!client.isReady) return
         scope.launch {
-            val activeSub = queryPurchasesForType(BillingClient.ProductType.SUBS)
+            val activeSub = queryPurchasesForType(client, BillingClient.ProductType.SUBS)
                 .firstOrNull { it.purchaseState == Purchase.PurchaseState.PURCHASED }
 
-            val active = activeSub ?: queryPurchasesForType(BillingClient.ProductType.INAPP)
+            val active = activeSub ?: queryPurchasesForType(client, BillingClient.ProductType.INAPP)
                 .firstOrNull { it.purchaseState == Purchase.PurchaseState.PURCHASED }
 
             if (active != null) {
-                if (!active.isAcknowledged) acknowledgePurchase(active)
-                prefs.edit()
-                    .putBoolean(KEY_ACTIVE, true)
-                    .putString(KEY_PRODUCT_ID, active.products.firstOrNull())
-                    .putString(KEY_TOKEN, active.purchaseToken)
-                    .apply()
+                if (!active.isAcknowledged) {
+                    // Opportunistic re-ack lane: outcome-aware (recorded and
+                    // retried on failure via acknowledgePurchase), no longer a
+                    // blind extra attempt.
+                    acknowledgePurchase(active)
+                } else if (store.pendingAckToken == active.purchaseToken) {
+                    // Play reports the pending token acknowledged (the retry
+                    // worker, a prior blind re-ack, or Play itself caught up):
+                    // isAcknowledged from a fresh query is authoritative success.
+                    AckRetryWorker.recordSuccess(store, active.purchaseToken)
+                    logd("pending ack cleared: Play reports token=…${active.purchaseToken.takeLast(8)} acknowledged")
+                }
+                store.subscriptionActive = true
+                store.subscriptionProductId = active.products.firstOrNull()
+                store.subscriptionToken = active.purchaseToken
             } else {
-                prefs.edit()
-                    .putBoolean(KEY_ACTIVE, false)
-                    .remove(KEY_PRODUCT_ID)
-                    .remove(KEY_TOKEN)
-                    .apply()
+                store.clearSubscription()
             }
+            // Backstop: a pending-ack record with no live retry chain (WorkManager
+            // state cleared by the OS or the user) gets re-scheduled here. KEEP
+            // policy makes this a no-op while the chain is alive. The worker's
+            // own query settles a record whose purchase has since vanished
+            // (terminal ITEM_NOT_OWNED) or aged out (three-day window).
+            if (store.pendingAckToken != null) AckRetryWorker.schedule(appContext)
             onPurchasesQueried?.invoke()
             onPurchasesQueried = null
         }
@@ -194,7 +328,8 @@ class PlayBillingCore(context: Context) {
      * Lifetime (INAPP): oneTimePurchaseOfferDetails.formattedPrice.
      */
     fun queryProductPrices() {
-        if (!billingClient.isReady || !isConfigured) return
+        val client = client()
+        if (!client.isReady || !isConfigured) return
         val yearly = yearlyProductId ?: return
         val lifetime = lifetimeProductId ?: return
 
@@ -217,7 +352,7 @@ class PlayBillingCore(context: Context) {
             .build()
 
         scope.launch {
-            billingClient.queryProductDetailsAsync(subsParams) { result, queryResult ->
+            client.queryProductDetailsAsync(subsParams) { result, queryResult ->
                 if (result.responseCode != BillingClient.BillingResponseCode.OK) return@queryProductDetailsAsync
                 for (details in queryResult.productDetailsList) {
                     if (details.productId != yearly) continue
@@ -229,19 +364,19 @@ class PlayBillingCore(context: Context) {
                     val trialPhase = offerDetails
                         .flatMap { it.pricingPhases.pricingPhaseList }
                         .firstOrNull { it.priceAmountMicros == 0L }
-                    val editor = prefs.edit()
-                    if (price != null) editor.putString(KEY_PRICE_ANNUAL, price)
-                    editor.putBoolean(KEY_TRIAL_ELIGIBLE, trialPhase != null)
-                    val days = trialPhase?.billingPeriod?.let { parseIsoPeriodToDays(it) }
-                    if (days != null && days > 0) editor.putInt(KEY_TRIAL_DAYS, days)
-                    editor.apply()
+                    if (price != null) store.priceAnnual = price
+                    store.trialEligibleAnnual = trialPhase != null
+                    trialPhase?.billingPeriod
+                        ?.let { parseIsoPeriodToDays(it) }
+                        ?.takeIf { it > 0 }
+                        ?.let { store.trialDaysAnnual = it }
                 }
             }
-            billingClient.queryProductDetailsAsync(inappParams) { result, queryResult ->
+            client.queryProductDetailsAsync(inappParams) { result, queryResult ->
                 if (result.responseCode != BillingClient.BillingResponseCode.OK) return@queryProductDetailsAsync
                 for (details in queryResult.productDetailsList) {
                     val price = details.oneTimePurchaseOfferDetails?.formattedPrice ?: continue
-                    if (details.productId == lifetime) prefs.edit().putString(KEY_PRICE_LIFETIME, price).apply()
+                    if (details.productId == lifetime) store.priceLifetime = price
                 }
             }
         }
@@ -263,7 +398,11 @@ class PlayBillingCore(context: Context) {
             onBillingEvent?.invoke("error", BillingClient.BillingResponseCode.DEVELOPER_ERROR, "activity_null", productId)
             return
         }
-        if (!billingClient.isReady) {
+        val client = client()
+        if (!client.isReady) {
+            // Reported, not repaired: reconnect-on-tap is a separate queued
+            // item (the not-ready purchase UX) and is deliberately not added
+            // here.
             Log.w(TAG, "launchPurchaseFlow($productId): client not ready")
             onBillingEvent?.invoke("error", BillingClient.BillingResponseCode.SERVICE_DISCONNECTED, "billing_not_ready", productId)
             return
@@ -283,7 +422,7 @@ class PlayBillingCore(context: Context) {
             .build()
 
         scope.launch {
-            billingClient.queryProductDetailsAsync(params) { result, queryResult ->
+            client.queryProductDetailsAsync(params) { result, queryResult ->
                 logd("launchPurchaseFlow($productId): query code=${result.responseCode} count=${queryResult.productDetailsList.size}")
 
                 if (result.responseCode != BillingClient.BillingResponseCode.OK) {
@@ -316,7 +455,7 @@ class PlayBillingCore(context: Context) {
                     .build()
 
                 act.runOnUiThread {
-                    val launchResult = billingClient.launchBillingFlow(act, flowParams)
+                    val launchResult = client.launchBillingFlow(act, flowParams)
                     logd("launchBillingFlow: code=${launchResult.responseCode}")
                     if (launchResult.responseCode != BillingClient.BillingResponseCode.OK) {
                         onBillingEvent?.invoke("error", launchResult.responseCode, launchResult.debugMessage, productId)
@@ -331,33 +470,50 @@ class PlayBillingCore(context: Context) {
         if (purchase.purchaseState != Purchase.PurchaseState.PURCHASED) return
         if (!purchase.isAcknowledged) acknowledgePurchase(purchase)
         val pid = purchase.products.firstOrNull()
-        prefs.edit()
-            .putBoolean(KEY_ACTIVE, true)
-            .putString(KEY_PRODUCT_ID, pid)
-            .putString(KEY_TOKEN, purchase.purchaseToken)
-            .apply()
+        store.subscriptionActive = true
+        store.subscriptionProductId = pid
+        store.subscriptionToken = purchase.purchaseToken
         onBillingEvent?.invoke("success", BillingClient.BillingResponseCode.OK, "", pid)
     }
 
+    /**
+     * Acknowledge a purchase, with the result recorded rather than discarded.
+     * Play refunds any purchase not acknowledged within three days, so a
+     * failure here is real money: it is persisted as a pending-ack record and
+     * retried by [AckRetryWorker] (WorkManager: survives process death and
+     * reboot, waits for connectivity, exponential backoff) until it succeeds,
+     * proves terminal, or ages past the three-day window. Entitlement is NOT
+     * gated on any of this — the cached active flag is set by the callers
+     * before or regardless of the ack outcome, deliberately. A paid but
+     * unacknowledged purchase is valid and the user keeps access.
+     */
     private fun acknowledgePurchase(purchase: Purchase) {
+        val token = purchase.purchaseToken
+        val productId = purchase.products.firstOrNull()
         val params = AcknowledgePurchaseParams.newBuilder()
-            .setPurchaseToken(purchase.purchaseToken)
+            .setPurchaseToken(token)
             .build()
-        billingClient.acknowledgePurchase(params) { /* fire and forget */ }
+        client().acknowledgePurchase(params) { result ->
+            if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                AckRetryWorker.recordSuccess(store, token)
+                logd("acknowledgePurchase OK: token=…${token.takeLast(8)}")
+            } else {
+                AckRetryWorker.recordFailureAndSchedule(
+                    appContext, store, token, productId, result.responseCode
+                )
+            }
+        }
     }
 
     // ── Test-only consume ────────────────────────────────────────────────────
 
     fun consumeTestPurchase(onComplete: (success: Boolean) -> Unit) {
-        val token = prefs.getString(KEY_TOKEN, null)
+        val token = store.subscriptionToken
         // Always clear the local cache so the subscription wall reappears immediately.
-        prefs.edit()
-            .putBoolean(KEY_ACTIVE, false)
-            .remove(KEY_PRODUCT_ID)
-            .remove(KEY_TOKEN)
-            .apply()
+        store.clearSubscription()
 
-        if (!billingClient.isReady) {
+        val client = client()
+        if (!client.isReady) {
             onComplete(true)
             return
         }
@@ -367,11 +523,11 @@ class PlayBillingCore(context: Context) {
             // stores the SUBS token (SUBS has priority), leaving the lifetime
             // INAPP token untouched. Querying INAPP directly ensures the lifetime
             // token is always consumed.
-            val inappPurchases = queryPurchasesForType(BillingClient.ProductType.INAPP)
+            val inappPurchases = queryPurchasesForType(client, BillingClient.ProductType.INAPP)
             for (purchase in inappPurchases) {
                 val p = ConsumeParams.newBuilder().setPurchaseToken(purchase.purchaseToken).build()
                 suspendCancellableCoroutine { cont ->
-                    billingClient.consumeAsync(p) { result, _ ->
+                    client.consumeAsync(p) { result, _ ->
                         logd("consumeAsync INAPP: code=${result.responseCode}")
                         cont.resume(Unit)
                     }
@@ -383,7 +539,7 @@ class PlayBillingCore(context: Context) {
             if (token != null && inappPurchases.none { it.purchaseToken == token }) {
                 val p = ConsumeParams.newBuilder().setPurchaseToken(token).build()
                 suspendCancellableCoroutine { cont ->
-                    billingClient.consumeAsync(p) { result, _ ->
+                    client.consumeAsync(p) { result, _ ->
                         logd("consumeAsync cached token: code=${result.responseCode}")
                         cont.resume(Unit)
                     }

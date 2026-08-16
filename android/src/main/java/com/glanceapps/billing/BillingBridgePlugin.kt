@@ -52,12 +52,34 @@ class BillingBridgePlugin : Plugin() {
         }
     }
 
+    /**
+     * Drops the activity reference and NOTHING ELSE. The billing connection is
+     * deliberately kept alive across backgrounding: a BillingClient is dead
+     * forever after endConnection(), so the old disconnect-here lifecycle
+     * killed billing (restores, purchases, entitlement refresh) for the rest
+     * of the process after the first background cycle. Final teardown is
+     * [handleOnDestroy].
+     */
     override fun handleOnStop() {
         super.handleOnStop()
-        core?.let { c ->
-            c.activity = null
-            if (c.isConfigured) c.disconnect()
-        }
+        core?.activity = null
+    }
+
+    /**
+     * Final teardown — the Capacitor equivalent of Activity.onDestroy().
+     * `Bridge.onDestroy()` calls this on every registered plugin, driven by
+     * `BridgeActivity.onDestroy()`.
+     *
+     * Load-bearing in ordinary use, not an edge case: neither consuming app
+     * declares `android:configChanges`, so rotation, a dark-mode toggle, a
+     * locale or font-size change and multi-window resizing all destroy the
+     * activity. Each recreation builds a new Bridge, a new plugin instance and
+     * a fresh [PlayBillingCore] in [load]. Without this, every one of those
+     * would leak a Play service binding.
+     */
+    override fun handleOnDestroy() {
+        super.handleOnDestroy()
+        core?.destroy()
     }
 
     @PluginMethod

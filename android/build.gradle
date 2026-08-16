@@ -2,6 +2,11 @@ ext {
     junitVersion = project.hasProperty('junitVersion') ? rootProject.ext.junitVersion : '4.13.2'
     androidxAppCompatVersion = project.hasProperty('androidxAppCompatVersion') ? rootProject.ext.androidxAppCompatVersion : '1.7.0'
     playBillingVersion = project.hasProperty('playBillingVersion') ? rootProject.ext.playBillingVersion : '8.3.0'
+    // WorkManager backs the acknowledgement retry lane (AckRetryWorker). The
+    // fallback is deliberately 2.9.1: lifeGLANCE already pins exactly that, so
+    // taking 0.2.2 does not silently bump a consumer's WorkManager. Override in
+    // variables.gradle like the other pins.
+    workManagerVersion = project.hasProperty('workManagerVersion') ? rootProject.ext.workManagerVersion : '2.9.1'
 }
 
 buildscript {
@@ -44,4 +49,15 @@ dependencies {
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
     implementation "com.android.billingclient:billing-ktx:$playBillingVersion"
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0'
+    // Acknowledgement retry lane: survives process death and reboot, waits for
+    // connectivity, drives the backoff. New transitive dependency for consumers
+    // that do not already use WorkManager — see CHANGELOG 0.2.2.
+    implementation "androidx.work:work-runtime-ktx:$workManagerVersion"
+
+    // BillingConnectionPolicy / AckRetryPolicy are plain Kotlin with no Android
+    // dependencies; their tests run on a plain JVM. There is no Android CI lane
+    // in this repo yet, so these are proven locally
+    // (./gradlew :glance-apps-billing:test from a consuming app, or the
+    // standalone JVM project described in the 0.2.2 PR).
+    testImplementation "junit:junit:$junitVersion"
 }
