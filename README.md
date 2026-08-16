@@ -148,7 +148,24 @@ ext {
    Do not set a 7.x version here — the plugin uses the Billing 8
    `queryProductDetailsAsync` callback signature and will not compile
    against 7.x.
-3. Construct the adapter:
+3. **WorkManager (v0.2.2+).** The plugin's acknowledgement retry lane uses
+   `androidx.work:work-runtime-ktx`, so the module brings it in transitively —
+   you do not need to add it. Its fallback is `2.9.1`; override it alongside
+   the other pins if your app already uses a different version:
+
+```groovy
+// variables.gradle
+ext {
+    workManagerVersion = '2.9.1'
+}
+```
+
+   Manifest merge adds WorkManager's `androidx.startup` initializer, its
+   job/alarm services, and the `WAKE_LOCK` + `RECEIVE_BOOT_COMPLETED`
+   permissions to your merged manifest. Both permissions are normal-level with
+   no runtime prompt, but they appear on your Play listing — worth a release
+   note if your audience reads permission diffs.
+4. Construct the adapter:
 
 ```ts
 import { registerPlugin } from '@capacitor/core';
@@ -163,7 +180,7 @@ const adapter = Capacitor.isNativePlatform()
   : null;
 ```
 
-4. Gate your app on `isUnlocked`, render your paywall from `prices` /
+5. Gate your app on `isUnlocked`, render your paywall from `prices` /
    `trialEligible` / `trialDays`, and wire `subscribe` / `restore` /
    the reviewer-code input.
 
@@ -217,3 +234,11 @@ Play Console product creation, and final product ids/prices.
   following the same ported logic** — they compile-verify only inside a
   consuming Capacitor app and have not shipped yet. Treat the first
   integration as their verification pass.
+- The v0.2.2 Android connection lifecycle and acknowledgement retry lane are
+  **ports of two device-confirmed fixes** from the production integration this
+  plugin was originally derived from. Their decision tables
+  (`BillingConnectionPolicy`, `AckRetryPolicy`) are dependency-free Kotlin and
+  are byte-identical to the originals below the package line; the JUnit tests
+  in `android/src/test/` come over with them. There is no Android CI lane in
+  this repo yet — run them with `./gradlew :glance-apps-billing:test` from a
+  consuming app.
