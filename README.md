@@ -116,12 +116,27 @@ Gate UI on **`isUnlocked`** (ungated ∨ entitled ∨ reviewer-unlocked).
 ```ts
 import { registerElectronBilling } from '@glance-apps/billing/electron-main';
 
-registerElectronBilling(mainWindow, {
+// Call once. Pass a getter, not the window: the pushes follow whatever window
+// is current when they are sent.
+registerElectronBilling(() => mainWindow, {
   rcApiKey: 'appl_XXXX',          // the iOS RevenueCat App Store key — shared under Universal Purchase
   entitlementId: 'pro',
   products: { yearly: 'com.acme.pro.yearly', lifetime: 'com.acme.pro.lifetime' },
 });
 ```
+
+**Pass a getter if the main window can ever be replaced** (v0.2.3+). An app
+that destroys its window on close and creates another when the Dock icon is
+clicked, or recreates one after a renderer crash, has a different
+`BrowserWindow` by the time a purchase settles. The getter is called on every
+push, so `subscription:event` and `subscription:prices-ready` reach the current
+window; return `null` while there is none. A bare `BrowserWindow` is still
+accepted for an app whose one window lives as long as the process, but its
+pushes stop for good once that window is destroyed: the purchase completes in
+StoreKit and the paywall never hears about it.
+
+Register once per process. The IPC handlers and the StoreKit observer are
+app-wide, and a second call throws on the duplicate handler.
 
 IPC channels are fixed protocol: `subscription:status`, `subscription:prices`,
 `subscription:purchase`, `subscription:restore`, plus the `subscription:event`

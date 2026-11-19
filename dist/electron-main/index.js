@@ -80,9 +80,26 @@ export function isMASBuild() {
     }
 }
 // ── Module state ──────────────────────────────────────────────────────────────
-let mainWin = null;
+// The window the pushes go to is RESOLVED AT SEND TIME, never captured. An app
+// that destroys its window on close and creates another on reactivation (the
+// macOS Dock pattern), or recreates one after a renderer crash, has a different
+// BrowserWindow by the time a purchase settles. Capturing the first one sent
+// every 'subscription:event' to a destroyed window from then on: StoreKit
+// completed the purchase, the paywall never heard, and its spinner never
+// cleared. The IPC handlers were unaffected (they are app-wide), which is what
+// made this look like a renderer bug.
+let resolveWindow = () => null;
 function live() {
-    return mainWin && !mainWin.isDestroyed() ? mainWin : null;
+    let win;
+    // A push is best-effort. The transaction observer must still reach
+    // finishTransactionByDate, so a getter that throws drops the push only.
+    try {
+        win = resolveWindow();
+    }
+    catch {
+        win = null;
+    }
+    return win && !win.isDestroyed() ? win : null;
 }
 function fireBillingEvent(payload) {
     live()?.webContents.send('subscription:event', payload);
@@ -271,7 +288,7 @@ export function registerElectronBilling(window, options) {
         logTag: '[subscription]',
         ...options,
     };
-    mainWin = window;
+    resolveWindow = typeof window === 'function' ? window : () => window;
     // Fetch prices once from StoreKit on startup and cache them.
     if (process.platform === 'darwin' && inAppPurchase.canMakePayments()) {
         inAppPurchase.getProducts([o.products.yearly, o.products.lifetime]).then((products) => {
