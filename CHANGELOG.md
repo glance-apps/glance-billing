@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.3 — 2026-11-18
+
+### Fixed: Electron billing events were lost once the main window was replaced
+
+`registerElectronBilling(window, options)` kept the `BrowserWindow` it was
+given at registration and sent every `subscription:event` and
+`subscription:prices-ready` push to it for the life of the process. An app
+whose window is destroyed and created again (closing on macOS and reopening
+from the Dock, or crash recovery) then had a live window that never heard a
+purchase or restore result: StoreKit completed the purchase, the entitlement
+was recorded, and the paywall's spinner never cleared until the next launch.
+The four `subscription:*` IPC handlers are app-wide and kept working, so a
+relaunch always showed the right state.
+
+- `registerElectronBilling` now also takes a getter,
+  `() => BrowserWindow | null | undefined`, resolved on every push
+  (`BillingWindowSource`). Return `null` while there is no window.
+- A getter that throws, or returns nothing, drops that push only. The
+  transaction observer still finishes the transaction, so nothing is left in
+  StoreKit's queue.
+- Passing a bare `BrowserWindow` behaves exactly as before. No consumer has to
+  change, but any app whose window can be replaced should pass a getter.
+
+No change to the engine, the adapters, the Android plugin or the IPC protocol.
+
 ## 0.2.2 — 2026-08-16
 
 Two Android billing defects, both ported from the production integration

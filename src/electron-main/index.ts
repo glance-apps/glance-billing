@@ -47,6 +47,20 @@ export interface ElectronBillingOptions {
 
 interface ResolvedOptions extends Required<ElectronBillingOptions> {}
 
+/**
+ * Where the 'subscription:event' and 'subscription:prices-ready' pushes go.
+ *
+ * Pass a GETTER if the app can ever have a different main window than the one
+ * it started with: closing destroys the window and reactivation creates a new
+ * one, or crash recovery recreates it. The getter is called on every push, so
+ * the events follow the current window; return null while there is none.
+ *
+ * A bare BrowserWindow is still accepted, for an app whose one window lives as
+ * long as the process (closing hides it). Once that window is destroyed the
+ * pushes are dropped.
+ */
+export type BillingWindowSource = BrowserWindow | (() => BrowserWindow | null | undefined);
+
 const RC_BASE = 'https://api.revenuecat.com/v1';
 
 // Cached StoreKit prices, populated once at startup. The renderer both receives
@@ -122,10 +136,22 @@ export function isMASBuild(): boolean {
 
 // ── Module state ──────────────────────────────────────────────────────────────
 
-let mainWin: BrowserWindow | null = null;
+// The window the pushes go to is RESOLVED AT SEND TIME, never captured. An app
+// that destroys its window on close and creates another on reactivation (the
+// macOS Dock pattern), or recreates one after a renderer crash, has a different
+// BrowserWindow by the time a purchase settles. Capturing the first one sent
+// every 'subscription:event' to a destroyed window from then on: StoreKit
+// completed the purchase, the paywall never heard, and its spinner never
+// cleared. The IPC handlers were unaffected (they are app-wide), which is what
+// made this look like a renderer bug.
+let resolveWindow: () => BrowserWindow | null | undefined = () => null;
 
 function live(): BrowserWindow | null {
-  return mainWin && !mainWin.isDestroyed() ? mainWin : null;
+  let win: BrowserWindow | null | undefined;
+  // A push is best-effort. The transaction observer must still reach
+  // finishTransactionByDate, so a getter that throws drops the push only.
+  try { win = resolveWindow(); } catch { win = null; }
+  return win && !win.isDestroyed() ? win : null;
 }
 
 function fireBillingEvent(payload: object): void {
@@ -308,14 +334,14 @@ function trialDaysFromProduct(product: Electron.Product): number | null {
 
 // ── Registration ─────────────────────────────────────────────────────────────
 
-export function registerElectronBilling(window: BrowserWindow, options: ElectronBillingOptions): void {
+export function registerElectronBilling(window: BillingWindowSource, options: ElectronBillingOptions): void {
   const o: ResolvedOptions = {
     restoreFallbackMs: 10_000,
     latchFileName: 'lifetime-purchased.json',
     logTag: '[subscription]',
     ...options,
   };
-  mainWin = window;
+  resolveWindow = typeof window === 'function' ? window : () => window;
 
   // Fetch prices once from StoreKit on startup and cache them.
   if (process.platform === 'darwin' && inAppPurchase.canMakePayments()) {

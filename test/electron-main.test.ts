@@ -27,6 +27,8 @@ const H = vi.hoisted(() => ({
   canMakePayments: false,
   products: [] as unknown[],
   userDataDir: '',
+  /** Dates passed to finishTransactionByDate, in order. */
+  finished: [] as string[],
 }));
 
 vi.mock('electron', () => ({
@@ -50,7 +52,7 @@ vi.mock('electron', () => ({
     },
     purchaseProduct: async () => true,
     restoreCompletedTransactions: () => {},
-    finishTransactionByDate: () => {},
+    finishTransactionByDate: (date: string) => { H.finished.push(date); },
   },
   net: { fetch: (...args: unknown[]) => H.fetchMock(...args) },
   app: { getPath: () => H.userDataDir },
@@ -110,6 +112,7 @@ beforeEach(() => {
   H.userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'billing-test-'));
   H.receiptURL = null;
   H.receiptQueue.length = 0;
+  H.finished.length = 0;
   originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
   Object.defineProperty(process, 'platform', { value: 'darwin' });
 });
@@ -376,6 +379,123 @@ describe('restore settlement — dual path', () => {
     expect(fs.existsSync(path.join(H.userDataDir, 'lifetime-purchased.json'))).toBe(true);
     const messages = H.sent.map(s => s.payload as { message?: string });
     expect(messages).toContainEqual(expect.objectContaining({ message: 'restore_complete_active' }));
+  });
+});
+
+describe('window source — the pushes follow the current window', () => {
+  // A window with its own outbox, so a test can tell which one was sent to.
+  function windowWithOutbox() {
+    const sent: Array<{ channel: string; payload: unknown }> = [];
+    let destroyed = false;
+    return {
+      sent,
+      destroy: () => { destroyed = true; },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      win: { isDestroyed: () => destroyed, webContents: { send: (channel: string, payload: unknown) => sent.push({ channel, payload }) } } as any,
+    };
+  }
+
+  const purchased = [{
+    transactionState: 'purchased',
+    transactionDate: 'txn-date',
+    payment: { productIdentifier: 'com.test.pro.yearly' },
+  }];
+
+  it('a getter is resolved at send time: a purchase in a recreated window reaches that window', async () => {
+    // The field bug: the app closes its window (destroyed) and the Dock
+    // reopens a new one. The first window was captured at registration, so the
+    // purchase's 'success' went nowhere and the paywall spinner never cleared.
+    writeReceipt();
+    const first = windowWithOutbox();
+    const second = windowWithOutbox();
+    let current = first;
+    const m = await freshModule();
+    m.registerElectronBilling(() => current.win, OPTS);
+    H.fetchMock.mockResolvedValue(rcResponse(200, activeSubscriber('com.test.pro.yearly', 60_000)));
+
+    first.destroy();
+    current = second;
+
+    await H.iapListeners.get('transactions-updated')!({}, purchased);
+    expect(first.sent).toHaveLength(0);
+    expect(second.sent).toEqual([
+      { channel: 'subscription:event', payload: expect.objectContaining({ status: 'success', productId: 'com.test.pro.yearly' }) },
+    ]);
+  });
+
+  it('a restore settles in the recreated window too (the fallback timer path)', async () => {
+    vi.useFakeTimers();
+    writeReceipt();
+    const first = windowWithOutbox();
+    const second = windowWithOutbox();
+    let current = first;
+    const m = await freshModule();
+    m.registerElectronBilling(() => current.win, OPTS);
+    H.fetchMock.mockResolvedValue(rcResponse(500, 'down'));
+
+    first.destroy();
+    current = second;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await H.handlers.get('subscription:restore')!({} as any);
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(first.sent).toHaveLength(0);
+    expect(second.sent.map(s => (s.payload as { message?: string }).message)).toEqual(['restore_complete']);
+  });
+
+  it('no window right now (getter returns null): the push is dropped, the transaction still finishes', async () => {
+    writeReceipt();
+    const m = await freshModule();
+    m.registerElectronBilling(() => null, OPTS);
+    H.fetchMock.mockResolvedValue(rcResponse(200, activeSubscriber('com.test.pro.yearly', 60_000)));
+
+    await expect(H.iapListeners.get('transactions-updated')!({}, purchased)).resolves.toBeUndefined();
+    // An unfinished transaction stays in StoreKit's queue and is redelivered on
+    // every launch: finishing must not depend on there being a window.
+    expect(H.finished).toEqual(['txn-date']);
+  });
+
+  it('a getter that throws drops the push only: the transaction still finishes', async () => {
+    writeReceipt();
+    const m = await freshModule();
+    m.registerElectronBilling(() => { throw new Error('window lookup failed'); }, OPTS);
+    H.fetchMock.mockResolvedValue(rcResponse(200, activeSubscriber('com.test.pro.yearly', 60_000)));
+
+    await expect(H.iapListeners.get('transactions-updated')!({}, purchased)).resolves.toBeUndefined();
+    expect(H.finished).toEqual(['txn-date']);
+  });
+
+  it('a bare window still works, and its pushes stop once it is destroyed', async () => {
+    writeReceipt();
+    const only = windowWithOutbox();
+    const m = await freshModule();
+    m.registerElectronBilling(only.win, OPTS);
+    H.fetchMock.mockResolvedValue(rcResponse(200, activeSubscriber('com.test.pro.yearly', 60_000)));
+
+    await H.iapListeners.get('transactions-updated')!({}, purchased);
+    expect(only.sent).toHaveLength(1);
+
+    only.destroy();
+    await H.iapListeners.get('transactions-updated')!({}, purchased);
+    expect(only.sent).toHaveLength(1);
+    expect(H.finished).toEqual(['txn-date', 'txn-date']);
+  });
+
+  it('the startup prices push goes to the window current when the store answers', async () => {
+    H.canMakePayments = true;
+    H.products = [{ productIdentifier: 'com.test.pro.lifetime', formattedPrice: '$49.99' }];
+    const first = windowWithOutbox();
+    const second = windowWithOutbox();
+    let current = first;
+    const m = await freshModule();
+    m.registerElectronBilling(() => current.win, OPTS);
+    current = second; // recreated before getProducts resolved
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(first.sent).toHaveLength(0);
+    expect(second.sent).toEqual([
+      { channel: 'subscription:prices-ready', payload: { yearly: null, lifetime: '$49.99', yearlyTrialDays: null } },
+    ]);
   });
 });
 
