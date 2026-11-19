@@ -20,11 +20,15 @@ jobs:
         with:
           node-version: "22"
 
-      # No package-lock.json is committed (it is gitignored), so `npm ci` — which
-      # requires a lockfile — is not usable here. `npm install` also runs the
-      # `prepare` script, which builds dist/.
+      # From the committed package-lock.json, so a run installs what the last
+      # one did. Without a lockfile every run resolved the newest of each
+      # development dependency, and one release far down the tree (a peer range
+      # naming a prerelease) crashed npm 10's resolver before anything was
+      # installed: "Cannot read properties of null (reading 'edgesOut')", on
+      # main as on every branch. `npm ci` also runs the `prepare` script, which
+      # builds dist/.
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build
         run: npm run build
