@@ -10,7 +10,24 @@
 // This adapter is written against the plugin contract in android/ and the
 // integration guide in README.md. It has not yet shipped in a production app;
 // the WebView adapters have.
+//
+// Two native capabilities are opt-in (0.2.4), so a plugin that predates them,
+// the Android one in this package included, drives this adapter exactly as
+// 0.2.3 did:
+//
+// - REFRESH COMPLETION. A plugin whose initialize() resolves
+//   `{ refreshReportsCompletion: true }` promises that refresh() resolves only
+//   once its re-query has finished and getStatus() reflects it. Restore and
+//   the foreground refresh then read when the work is done, instead of after
+//   restoreSettleMs / refreshSettleMs, which were guesses at how long it
+//   takes. A slow sync used to be read before it finished, and Restore told a
+//   paying customer it had found nothing. Without the flag the timers decide,
+//   as before. The mount sequence is unchanged either way (see onMount).
+// - STATUS PUSHES. A 'billingStatus' event carrying `{ active, productId }` is
+//   applied as a status reading, ACTIVE ONLY (see ./statusChannel.ts). A
+//   plugin that never emits it changes nothing.
 import { SafeStorage } from '../storage.js';
+import { activeOnlyReading } from './statusChannel.js';
 export function createCapacitorAdapter(opts) {
     const { plugin, products } = opts;
     const storage = new SafeStorage(opts.storage ?? undefined);
@@ -18,10 +35,40 @@ export function createCapacitorAdapter(opts) {
     const restoreSettleMs = opts.timings?.restoreSettleMs ?? 4000;
     const refreshSettleMs = opts.timings?.refreshSettleMs ?? 2000;
     const mountRereadMs = opts.timings?.mountRereadMs ?? 3000;
-    void plugin.initialize({
+    const refreshCompletionCapMs = opts.timings?.refreshCompletionCapMs ?? 30_000;
+    // Learned from initialize(); false until it says otherwise, so a restore
+    // tapped before it resolves, and every plugin that never says, keeps the
+    // 0.2.3 timers.
+    let refreshReportsCompletion = false;
+    Promise.resolve(plugin.initialize({
         yearlyProductId: products.yearly,
         lifetimeProductId: products.lifetime,
-    });
+    })).then((result) => {
+        refreshReportsCompletion = !!result && result.refreshReportsCompletion === true;
+    }).catch(() => { });
+    /**
+     * Run `read` once the refresh `kick` has done its work. A plugin that
+     * reports completion is read when kick settles (resolved or rejected: either
+     * way the native work is over), capped by refreshCompletionCapMs; any other
+     * plugin is read after `legacySettleMs`, exactly as in 0.2.3.
+     */
+    const whenRefreshed = (kick, legacySettleMs, read) => {
+        if (!refreshReportsCompletion) {
+            kick.catch(() => { });
+            setTimeout(read, legacySettleMs);
+            return;
+        }
+        let done = false;
+        const settle = () => {
+            if (done)
+                return;
+            done = true;
+            clearTimeout(cap);
+            read();
+        };
+        const cap = setTimeout(settle, refreshCompletionCapMs);
+        kick.then(settle, settle);
+    };
     const readCachedStatus = () => {
         try {
             const raw = storage.getItem(statusCacheKey);
@@ -72,6 +119,10 @@ export function createCapacitorAdapter(opts) {
         readPrices: () => ({ yearly: null, lifetime: null }),
         readTrial: () => ({ eligible: true, days: null }),
         onMount(apply) {
+            // Deliberately NOT completion-aware: the mount sequence stays exactly
+            // two status reads (now and at mountRereadMs). The iOS plugin's Debug
+            // `-GlanceBillingStartLocked` override counts those two reads to open
+            // the app at the paywall; a third mount read would unlock it by itself.
             plugin.refresh().catch(() => { });
             checkStatus().then(apply.applyStatus).catch(() => { });
             setTimeout(() => {
@@ -80,13 +131,12 @@ export function createCapacitorAdapter(opts) {
             }, mountRereadMs);
         },
         refresh(apply) {
-            plugin.refresh().catch(() => { });
-            setTimeout(() => {
+            whenRefreshed(plugin.refresh(), refreshSettleMs, () => {
                 checkStatus().then(apply.applyStatus).catch(() => { });
                 plugin.getProductPrices().then((p) => {
                     apply.setPrices({ yearly: p.yearly ?? null, lifetime: p.lifetime ?? null });
                 }).catch(() => { });
-            }, refreshSettleMs);
+            });
         },
         purchase(productId) {
             plugin.purchase({ productId }).catch(() => { });
@@ -94,10 +144,12 @@ export function createCapacitorAdapter(opts) {
         restore(apply) {
             // Play Billing has no restore API — a re-query IS the restore. Same
             // settle pattern as the WebView Android adapter, including the
-            // 'restore_complete_active' contract.
-            plugin.refresh().catch(() => { });
+            // 'restore_complete_active' contract. The read happens once the native
+            // re-query has finished when the plugin reports that, otherwise after
+            // restoreSettleMs.
+            const kick = plugin.refresh();
             apply.setLoading(true);
-            setTimeout(() => {
+            whenRefreshed(kick, restoreSettleMs, () => {
                 checkStatus()
                     .then((s) => {
                     apply.applyStatus(s);
@@ -115,22 +167,33 @@ export function createCapacitorAdapter(opts) {
                         status: 'cancelled', code: 0, message: 'restore_complete', productId: '',
                     });
                 });
-            }, restoreSettleMs);
+            });
         },
         bindEvents(apply) {
             let removed = false;
-            let removeFn = null;
-            Promise.resolve(plugin.addListener('billingEvent', (ev) => apply.emitBillingEvent(ev)))
-                .then((handle) => {
-                removeFn = handle.remove;
-                if (removed)
-                    void handle.remove();
-            })
-                .catch(() => { });
+            const removeFns = [];
+            const hold = (registration) => {
+                Promise.resolve(registration)
+                    .then((handle) => {
+                    removeFns.push(handle.remove);
+                    if (removed)
+                        void handle.remove();
+                })
+                    .catch(() => { });
+            };
+            hold(plugin.addListener('billingEvent', (ev) => apply.emitBillingEvent(ev)));
+            // Pushed readings go to the gate, never through emitBillingEvent: they
+            // are not purchase outcomes, so they must not touch the paywall's event
+            // state, a restore spinner, or an in-flight purchase's timeout.
+            hold(plugin.addListener('billingStatus', (update) => {
+                const reading = activeOnlyReading(update);
+                if (reading)
+                    apply.applyStatus(reading);
+            }));
             return () => {
                 removed = true;
-                if (removeFn)
-                    void removeFn();
+                for (const remove of removeFns)
+                    void remove();
             };
         },
         persistStatusCache(reading) {

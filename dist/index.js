@@ -11,7 +11,7 @@ export { BillingEngine } from './engine.js';
 export { DEFAULT_TIMINGS, DEFAULT_STORAGE_KEYS, } from './config.js';
 export { SafeStorage } from './storage.js';
 export { deriveReviewerCode, sha256Hex } from './reviewer.js';
-export { billingErrorMessage } from './errors.js';
+export { billingErrorMessage, BILLING_CODE_PENDING, BILLING_CODE_UNCONFIRMED } from './errors.js';
 export { playManageSubscriptionUrl, appleManageSubscriptionUrl } from './urls.js';
 export { createAndroidWebViewAdapter, } from './adapters/android-webview.js';
 export { createIOSWebViewAdapter, } from './adapters/ios-webview.js';

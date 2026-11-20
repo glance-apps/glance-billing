@@ -120,6 +120,16 @@ export class BillingEngine {
                 clearTimeout(this.downgradeTimer);
                 this.downgradeTimer = null;
             }
+            if (this.isAppliedActive(next)) {
+                // The same active reading again: a purchase's 'success' event and the
+                // native layer's status push for that purchase, the post-purchase
+                // re-reads, a push of cached info at launch. Re-applying it would
+                // notify every subscriber (re-rendering the app's root) and rewrite
+                // storage with what is already there, so nothing is applied. The
+                // pending downgrade, if any, was still cancelled above.
+                this.refreshLastActiveHint(next);
+                return;
+            }
             this.setState({ status: next });
             const hint = { productId: next.productId ?? null, verifiedAt: this.now() };
             this.storage.setItem(this.keys.lastActive, JSON.stringify(hint));
@@ -139,6 +149,35 @@ export class BillingEngine {
             this.storage.removeItem(this.keys.lastActive);
             this.adapter?.persistStatusCache?.(next);
         }, this.timings.downgradeGraceMs);
+    }
+    /**
+     * True when `next` (an active reading) is exactly what is already applied:
+     * a confirmed, non-provisional active status for the same product. A
+     * provisional cold-launch unlock is not "applied" in this sense; its first
+     * real active reading must replace it.
+     */
+    isAppliedActive(next) {
+        const cur = this.state.status;
+        return cur.active
+            && !cur.provisional
+            && !cur.indeterminate
+            && !next.provisional
+            && (cur.productId ?? null) === (next.productId ?? null);
+    }
+    /**
+     * On a repeated active reading, the last-active hint is written only when
+     * it would say something new: it is missing or names another product, or
+     * offline grace is on, which anchors on `verifiedAt` and so needs every
+     * verification recorded. With offline grace off (the default) `verifiedAt`
+     * is never read, and rewriting it would be a write with no effect.
+     */
+    refreshLastActiveHint(next) {
+        const stored = this.readLastActiveHint();
+        const productId = next.productId ?? null;
+        if (this.offlineGraceDays === undefined && stored && (stored.productId ?? null) === productId)
+            return;
+        const hint = { productId, verifiedAt: this.now() };
+        this.storage.setItem(this.keys.lastActive, JSON.stringify(hint));
     }
     /**
      * Indeterminate readings are ignored — with one config-gated exception:
@@ -196,6 +235,10 @@ export class BillingEngine {
             // on a possibly-stale cache read.
             const purchased = parsed.status === 'success';
             const restoredActive = parsed.message === 'restore_complete_active';
+            // 'pending' (deferred, or completed but not yet confirmed) changes no
+            // entitlement in either direction. It is recorded below like any other
+            // terminal event, which ends the purchase spinner and its timeout; the
+            // unlock, if it comes, arrives later as a status reading.
             // A successful test-consume is a validated, deliberate revocation — as
             // authoritative in the lock direction as a purchase is in the unlock
             // direction. Apply it immediately, bypassing the anti-flash hold (whose

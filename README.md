@@ -59,6 +59,33 @@ this package was extracted from. The unit tests in `test/` lock them in.
     adapter (`adapter: null` → ungated). No env vars, no debug flags in
     release artifacts.
 
+11. **Pushed status readings are ACTIVE ONLY** (0.2.4). The iOS shells push
+    RevenueCat's updated customer info (its `PurchasesDelegate`) so an
+    entitlement that arrives outside the purchase flow unlocks when it
+    arrives: a purchase whose post to RevenueCat was retried, an Ask to Buy
+    approved later, an entitlement transferred back from another device. A
+    push can rescue an entitlement and never revoke one: both Apple platforms
+    write to one RevenueCat project under different anonymous ids, so the Mac
+    app posting its receipt can move the entitlement off the iPhone's
+    customer, and a push that applied inactive readings would downgrade a
+    paying customer's phone. Revocation stays with the pulled readings and
+    the downgrade hold. The filter is in the package (`statusChannel.ts`),
+    and pushes go to the gate, never the billing-event channel, so they
+    cannot touch the paywall's event state, a restore spinner, or a
+    purchase's timeout.
+12. **Restore reads when the native work is done, where the plugin says when**
+    (0.2.4). A Capacitor plugin that resolves `initialize()` with
+    `{ refreshReportsCompletion: true }` is read when its `refresh()` settles
+    instead of after the 4 s restore / 2 s foreground guesses, which told a
+    paying customer "nothing found" when a sync ran long. Plugins that do not
+    say so, the Android one included, keep the timers exactly
+    (`test/android-unchanged.test.ts` runs 0.2.3 beside the current code).
+    The mount sequence stays two reads either way.
+13. **A repeated active reading is a no-op** (0.2.4). Every purchase now
+    yields a `success` event and a pushed reading, and the post-purchase
+    re-reads repeat it again; none of the repeats notifies subscribers or
+    rewrites storage.
+
 There are **two different grace mechanisms** — don't conflate them:
 
 - `timings.downgradeGraceMs` — the 12-second anti-flash hold above.
@@ -195,6 +222,22 @@ const adapter = Capacitor.isNativePlatform()
   : null;
 ```
 
+   The plugin contract the adapter drives (Android in `android/`; the iOS
+   plugin lives in each app):
+
+   - `initialize({ yearlyProductId, lifetimeProductId })` may resolve
+     `{ refreshReportsCompletion: true }` (0.2.4). That is a promise that
+     `refresh()` resolves only once its re-query has finished and
+     `getStatus()` reflects it, and that a `refresh()` overlapping one already
+     running resolves no earlier than that one does. Restore and the
+     foreground refresh then read on completion (capped at
+     `timings.refreshCompletionCapMs`, 30 s, for a call that never settles).
+     Resolve with nothing to keep the settle timers.
+   - Event `billingEvent` `{ status, code, message, productId }`: purchase
+     outcomes.
+   - Event `billingStatus` `{ active, productId }` (0.2.4): a pushed
+     entitlement reading. Only `active: true` is applied.
+
 5. Gate your app on `isUnlocked`, render your paywall from `prices` /
    `trialEligible` / `trialDays`, and wire `subscribe` / `restore` /
    the reviewer-code input.
@@ -214,6 +257,14 @@ shapes (see `AndroidBillingBridge` / `IOSBillingBridge`):
   intro-offer metadata; null/absent when unknown)
 - `getTrialEligibility()` → `{"<yearlyProductId>": bool}`
 - terminal events → `window.__billingEvent({status, code, message, productId})`
+- pushed entitlement readings (iOS, 0.2.4) →
+  `window.__billingStatus({active, productId})`; only `active: true` is
+  applied (rule 11)
+- a purchase that ends neither failed nor confirmed (0.2.4) →
+  `{status: 'pending', code}` with `BILLING_CODE_PENDING` (deferred: Ask to
+  Buy, extra authentication) or `BILLING_CODE_UNCONFIRMED` (the store
+  completed it but the entitlement it returned lacks the app's). It changes
+  no entitlement; the unlock, if it comes, arrives as a pushed reading.
 
 ## Reconciliation with `paywall-billing-plan.md`
 

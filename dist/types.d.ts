@@ -42,7 +42,7 @@ export interface TrialInfo {
     eligible: boolean;
     days: number | null;
 }
-export type BillingEventStatus = 'success' | 'cancelled' | 'error' | 'consumed' | 'consume_failed';
+export type BillingEventStatus = 'success' | 'cancelled' | 'error' | 'pending' | 'consumed' | 'consume_failed';
 /**
  * Terminal billing event, shared shape across every platform bridge.
  *
@@ -52,6 +52,12 @@ export type BillingEventStatus = 'success' | 'cancelled' | 'error' | 'consumed' 
  * purchase. 'success' and 'restore_complete_active' are only ever emitted AFTER
  * the platform has validated the entitlement, which is why the engine trusts
  * them enough to unlock optimistically.
+ *
+ * 'pending' (0.2.4) ends a purchase that is neither failed nor confirmed: the
+ * store has taken it, or will once someone approves it, but the entitlement is
+ * not yet granted. It never unlocks and never locks; the unlock, when it comes,
+ * arrives later as a status reading (see BillingAdapter.bindEvents). The code
+ * says which case it is: BILLING_CODE_PENDING or BILLING_CODE_UNCONFIRMED.
  */
 export interface BillingEvent {
     status: BillingEventStatus;

@@ -18,6 +18,12 @@ export interface IOSWebViewAdapterOptions {
     bridge: IOSBillingBridge;
     products: ProductIds;
     eventGlobal?: string;
+    /**
+     * Window global the shell calls with a pushed entitlement reading,
+     * `{"active":bool,"productId":string|null}` (object or JSON string). Only an
+     * active reading is ever applied.
+     */
+    statusGlobal?: string;
     timings?: {
         /** Mount: RevenueCat caches status; re-read after this delay so it has
          * had time to refresh from its background network call. */

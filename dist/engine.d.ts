@@ -133,6 +133,21 @@ export declare class BillingEngine {
      */
     applyStatus(next: StatusReading | null | undefined): void;
     /**
+     * True when `next` (an active reading) is exactly what is already applied:
+     * a confirmed, non-provisional active status for the same product. A
+     * provisional cold-launch unlock is not "applied" in this sense; its first
+     * real active reading must replace it.
+     */
+    private isAppliedActive;
+    /**
+     * On a repeated active reading, the last-active hint is written only when
+     * it would say something new: it is missing or names another product, or
+     * offline grace is on, which anchors on `verifiedAt` and so needs every
+     * verification recorded. With offline grace off (the default) `verifiedAt`
+     * is never read, and rewriting it would be a write with no effect.
+     */
+    private refreshLastActiveHint;
+    /**
      * Indeterminate readings are ignored — with one config-gated exception:
      * when offlineGraceDays is set and the last verified-active timestamp has
      * expired, an indeterminate reading on an unlocked install escalates into
