@@ -10,23 +10,62 @@
 // This adapter is written against the plugin contract in android/ and the
 // integration guide in README.md. It has not yet shipped in a production app;
 // the WebView adapters have.
+//
+// Two native capabilities are opt-in (0.2.4), so a plugin that predates them,
+// the Android one in this package included, drives this adapter exactly as
+// 0.2.3 did:
+//
+// - REFRESH COMPLETION. A plugin whose initialize() resolves
+//   `{ refreshReportsCompletion: true }` promises that refresh() resolves only
+//   once its re-query has finished and getStatus() reflects it. Restore and
+//   the foreground refresh then read when the work is done, instead of after
+//   restoreSettleMs / refreshSettleMs, which were guesses at how long it
+//   takes. A slow sync used to be read before it finished, and Restore told a
+//   paying customer it had found nothing. Without the flag the timers decide,
+//   as before. The mount sequence is unchanged either way (see onMount).
+// - STATUS PUSHES. A 'billingStatus' event carrying `{ active, productId }` is
+//   applied as a status reading, ACTIVE ONLY (see ./statusChannel.ts). A
+//   plugin that never emits it changes nothing.
 
 import type { ApplyCallbacks, BillingAdapter } from './types.js';
 import type { BillingEvent, Prices, ProductIds, StatusReading, StorageLike, TrialInfo } from '../types.js';
 import { SafeStorage } from '../storage.js';
+import { activeOnlyReading } from './statusChannel.js';
+
+/** What initialize() may resolve with: the native capabilities it supports. */
+export interface CapacitorInitializeResult {
+  /**
+   * refresh() resolves only once its re-query has finished, and a refresh()
+   * that overlaps one already running resolves no earlier than that one does.
+   */
+  refreshReportsCompletion?: boolean;
+}
+
+/** A pushed entitlement reading. Only `active: true` is ever applied. */
+export interface CapacitorStatusUpdate {
+  active: boolean;
+  productId: string | null;
+}
+
+/** The events a BillingBridge plugin can emit, by name. */
+export interface CapacitorBillingEvents {
+  billingEvent: BillingEvent;
+  billingStatus: CapacitorStatusUpdate;
+}
 
 /** The Capacitor plugin surface (registerPlugin<CapacitorBillingPlugin>('BillingBridge')). */
 export interface CapacitorBillingPlugin {
-  initialize(options: { yearlyProductId: string; lifetimeProductId: string }): Promise<void>;
+  initialize(options: { yearlyProductId: string; lifetimeProductId: string }): Promise<CapacitorInitializeResult | void>;
   getStatus(): Promise<{ active: boolean; productId: string | null }>;
+  /** See CapacitorInitializeResult.refreshReportsCompletion for when it resolves. */
   refresh(): Promise<void>;
   purchase(options: { productId: string }): Promise<void>;
   getProductPrices(): Promise<{ yearly: string | null; lifetime: string | null; yearlyTrialDays?: number | null }>;
   getTrialEligibility(): Promise<Record<string, boolean>>;
   consumeTestPurchase?(): Promise<void>;
-  addListener(
-    eventName: 'billingEvent',
-    listener: (event: BillingEvent) => void,
+  addListener<E extends keyof CapacitorBillingEvents>(
+    eventName: E,
+    listener: (event: CapacitorBillingEvents[E]) => void,
   ): Promise<{ remove: () => Promise<void> }> | { remove: () => Promise<void> };
 }
 
@@ -36,12 +75,25 @@ export interface CapacitorAdapterOptions {
   statusCacheKey?: string;
   storage?: StorageLike | null;
   timings?: {
-    /** Restore: how long to give the native re-query before settling. */
+    /**
+     * Restore: how long to give the native re-query before settling. Used only
+     * when the plugin does not report refresh completion.
+     */
     restoreSettleMs?: number;
-    /** Refresh: how long to give the native re-query before re-reading. */
+    /**
+     * Refresh: how long to give the native re-query before re-reading. Used
+     * only when the plugin does not report refresh completion.
+     */
     refreshSettleMs?: number;
     /** Mount: trial/prices re-read delay after the refresh kick. */
     mountRereadMs?: number;
+    /**
+     * When the plugin reports refresh completion: the longest a restore or
+     * refresh waits for it before reading anyway. A safety net for a native
+     * call that never settles, not a guess at how long one takes; it stays
+     * under the paywalls' 45 s restore give-up so a restore still concludes.
+     */
+    refreshCompletionCapMs?: number;
   };
 }
 
@@ -52,11 +104,41 @@ export function createCapacitorAdapter(opts: CapacitorAdapterOptions): BillingAd
   const restoreSettleMs = opts.timings?.restoreSettleMs ?? 4000;
   const refreshSettleMs = opts.timings?.refreshSettleMs ?? 2000;
   const mountRereadMs = opts.timings?.mountRereadMs ?? 3000;
+  const refreshCompletionCapMs = opts.timings?.refreshCompletionCapMs ?? 30_000;
 
-  void plugin.initialize({
+  // Learned from initialize(); false until it says otherwise, so a restore
+  // tapped before it resolves, and every plugin that never says, keeps the
+  // 0.2.3 timers.
+  let refreshReportsCompletion = false;
+  Promise.resolve(plugin.initialize({
     yearlyProductId: products.yearly,
     lifetimeProductId: products.lifetime,
-  });
+  })).then((result) => {
+    refreshReportsCompletion = !!result && result.refreshReportsCompletion === true;
+  }).catch(() => {});
+
+  /**
+   * Run `read` once the refresh `kick` has done its work. A plugin that
+   * reports completion is read when kick settles (resolved or rejected: either
+   * way the native work is over), capped by refreshCompletionCapMs; any other
+   * plugin is read after `legacySettleMs`, exactly as in 0.2.3.
+   */
+  const whenRefreshed = (kick: Promise<void>, legacySettleMs: number, read: () => void): void => {
+    if (!refreshReportsCompletion) {
+      kick.catch(() => {});
+      setTimeout(read, legacySettleMs);
+      return;
+    }
+    let done = false;
+    const settle = (): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(cap);
+      read();
+    };
+    const cap = setTimeout(settle, refreshCompletionCapMs);
+    kick.then(settle, settle);
+  };
 
   const readCachedStatus = (): StatusReading => {
     try {
@@ -110,6 +192,10 @@ export function createCapacitorAdapter(opts: CapacitorAdapterOptions): BillingAd
     readTrial: (): TrialInfo => ({ eligible: true, days: null }),
 
     onMount(apply: ApplyCallbacks): void {
+      // Deliberately NOT completion-aware: the mount sequence stays exactly
+      // two status reads (now and at mountRereadMs). The iOS plugin's Debug
+      // `-GlanceBillingStartLocked` override counts those two reads to open
+      // the app at the paywall; a third mount read would unlock it by itself.
       plugin.refresh().catch(() => {});
       checkStatus().then(apply.applyStatus).catch(() => {});
       setTimeout(() => {
@@ -119,13 +205,12 @@ export function createCapacitorAdapter(opts: CapacitorAdapterOptions): BillingAd
     },
 
     refresh(apply: ApplyCallbacks): void {
-      plugin.refresh().catch(() => {});
-      setTimeout(() => {
+      whenRefreshed(plugin.refresh(), refreshSettleMs, () => {
         checkStatus().then(apply.applyStatus).catch(() => {});
         plugin.getProductPrices().then((p) => {
           apply.setPrices({ yearly: p.yearly ?? null, lifetime: p.lifetime ?? null });
         }).catch(() => {});
-      }, refreshSettleMs);
+      });
     },
 
     purchase(productId: string): void {
@@ -135,10 +220,12 @@ export function createCapacitorAdapter(opts: CapacitorAdapterOptions): BillingAd
     restore(apply: ApplyCallbacks): void {
       // Play Billing has no restore API — a re-query IS the restore. Same
       // settle pattern as the WebView Android adapter, including the
-      // 'restore_complete_active' contract.
-      plugin.refresh().catch(() => {});
+      // 'restore_complete_active' contract. The read happens once the native
+      // re-query has finished when the plugin reports that, otherwise after
+      // restoreSettleMs.
+      const kick = plugin.refresh();
       apply.setLoading(true);
-      setTimeout(() => {
+      whenRefreshed(kick, restoreSettleMs, () => {
         checkStatus()
           .then((s) => {
             apply.applyStatus(s);
@@ -156,21 +243,31 @@ export function createCapacitorAdapter(opts: CapacitorAdapterOptions): BillingAd
               status: 'cancelled', code: 0, message: 'restore_complete', productId: '',
             });
           });
-      }, restoreSettleMs);
+      });
     },
 
     bindEvents(apply: ApplyCallbacks): () => void {
       let removed = false;
-      let removeFn: (() => Promise<void>) | null = null;
-      Promise.resolve(plugin.addListener('billingEvent', (ev) => apply.emitBillingEvent(ev)))
-        .then((handle) => {
-          removeFn = handle.remove;
-          if (removed) void handle.remove();
-        })
-        .catch(() => {});
+      const removeFns: Array<() => Promise<void>> = [];
+      const hold = (registration: ReturnType<CapacitorBillingPlugin['addListener']>): void => {
+        Promise.resolve(registration)
+          .then((handle) => {
+            removeFns.push(handle.remove);
+            if (removed) void handle.remove();
+          })
+          .catch(() => {});
+      };
+      hold(plugin.addListener('billingEvent', (ev) => apply.emitBillingEvent(ev)));
+      // Pushed readings go to the gate, never through emitBillingEvent: they
+      // are not purchase outcomes, so they must not touch the paywall's event
+      // state, a restore spinner, or an in-flight purchase's timeout.
+      hold(plugin.addListener('billingStatus', (update) => {
+        const reading = activeOnlyReading(update);
+        if (reading) apply.applyStatus(reading);
+      }));
       return () => {
         removed = true;
-        if (removeFn) void removeFn();
+        for (const remove of removeFns) void remove();
       };
     },
 

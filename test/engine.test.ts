@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BillingEngine, type EngineConfig } from '../src/engine.js';
 import type { BillingAdapter } from '../src/adapters/types.js';
 import type { StatusReading, StorageLike } from '../src/types.js';
+import { BILLING_CODE_PENDING, BILLING_CODE_UNCONFIRMED } from '../src/errors.js';
+import * as index from '../src/index.js';
 
 class MemStorage implements StorageLike {
   map = new Map<string, string>();
@@ -359,5 +361,110 @@ describe('ungated (no adapter — web/PWA/dev)', () => {
     engine.purchase('x');
     engine.restore();
     expect(engine.getSnapshot().billingEvent).toBeNull();
+  });
+});
+
+describe("'pending' purchase outcome (0.2.4)", () => {
+  it('changes no entitlement in either direction, and ends the purchase spinner like any outcome', () => {
+    const locked = makeEngine(makeAdapter());
+    locked.engine.start();
+    locked.engine.purchase('p1');
+    locked.engine['applyCallbacks'].emitBillingEvent({ status: 'pending', code: BILLING_CODE_PENDING, message: 'deferred', productId: 'p1' });
+    expect(locked.engine.getSnapshot().isPro).toBe(false);
+    expect(locked.engine.getSnapshot().billingEvent).toMatchObject({ status: 'pending', code: BILLING_CODE_PENDING });
+    vi.advanceTimersByTime(60_000);
+    // The purchase timeout was cleared by the outcome: no synthetic 'timeout'.
+    expect(locked.engine.getSnapshot().billingEvent).toMatchObject({ status: 'pending' });
+
+    const unlocked = makeEngine(makeAdapter({ cached: { active: true, productId: 'p1' } }));
+    unlocked.engine.start();
+    unlocked.engine['applyCallbacks'].emitBillingEvent({ status: 'pending', code: BILLING_CODE_UNCONFIRMED, message: '', productId: 'p1' });
+    vi.advanceTimersByTime(GRACE * 2);
+    expect(unlocked.engine.getSnapshot().isPro).toBe(true);
+  });
+
+  it('the pending codes sit outside the Play response-code space and are exported', () => {
+    expect(BILLING_CODE_PENDING).not.toBe(BILLING_CODE_UNCONFIRMED);
+    for (const code of [BILLING_CODE_PENDING, BILLING_CODE_UNCONFIRMED]) {
+      expect(code < -3 || code > 12).toBe(true);
+    }
+    expect(index.BILLING_CODE_PENDING).toBe(BILLING_CODE_PENDING);
+    expect(index.BILLING_CODE_UNCONFIRMED).toBe(BILLING_CODE_UNCONFIRMED);
+  });
+});
+
+describe('a repeated active reading is a no-op (0.2.4, ruling 7)', () => {
+  it('no notification, no status-cache write, no hint rewrite', () => {
+    const storage = new MemStorage();
+    const adapter = makeAdapter();
+    const { engine } = makeEngine(adapter, { storage });
+    engine.start();
+    engine.applyStatus({ active: true, productId: 'p1' });
+    const hint = storage.getItem('glance-billing.last-active');
+    let notifications = 0;
+    engine.subscribe(() => { notifications += 1; });
+    const snapshot = engine.getSnapshot();
+
+    vi.advanceTimersByTime(5000);
+    engine.applyStatus({ active: true, productId: 'p1' });
+    engine.applyStatus({ active: true, productId: 'p1' });
+
+    expect(notifications).toBe(0);
+    expect(engine.getSnapshot()).toBe(snapshot); // same object: React sees no change
+    expect(adapter.persisted).toHaveLength(1);
+    expect(storage.getItem('glance-billing.last-active')).toBe(hint);
+  });
+
+  it('a different product is a change, and is applied', () => {
+    const adapter = makeAdapter();
+    const { engine } = makeEngine(adapter);
+    engine.start();
+    engine.applyStatus({ active: true, productId: 'p1' });
+    engine.applyStatus({ active: true, productId: 'p2' });
+    expect(engine.getSnapshot().productId).toBe('p2');
+    expect(adapter.persisted).toHaveLength(2);
+  });
+
+  it('a provisional cold-launch unlock is replaced by the first real active reading', () => {
+    const storage = new MemStorage();
+    storage.setItem('glance-billing.last-active', JSON.stringify({ productId: 'p1', verifiedAt: 0 }));
+    const adapter = makeAdapter();
+    const { engine } = makeEngine(adapter, { storage });
+    engine.start();
+    expect(engine.getSnapshot().status.provisional).toBe(true);
+    engine.applyStatus({ active: true, productId: 'p1' });
+    expect(engine.getSnapshot().status.provisional).toBeUndefined();
+    expect(adapter.persisted).toHaveLength(1);
+  });
+
+  it('an identical active reading still cancels a pending downgrade', () => {
+    const { engine } = makeEngine(makeAdapter());
+    engine.start();
+    engine.applyStatus({ active: true, productId: 'p1' });
+    engine.applyStatus({ active: false, productId: null });
+    vi.advanceTimersByTime(GRACE / 2);
+    engine.applyStatus({ active: true, productId: 'p1' });
+    vi.advanceTimersByTime(GRACE * 2);
+    expect(engine.getSnapshot().isPro).toBe(true);
+  });
+
+  it('with offline grace ON, every verification still refreshes verifiedAt (it anchors the grace)', () => {
+    const storage = new MemStorage();
+    let now = 1_000;
+    const { engine } = makeEngine(makeAdapter(), { storage, offlineGraceDays: 7, now: () => now });
+    engine.start();
+    engine.applyStatus({ active: true, productId: 'p1' });
+    now = 86_400_000 * 3;
+    engine.applyStatus({ active: true, productId: 'p1' });
+    expect(JSON.parse(storage.getItem('glance-billing.last-active')!).verifiedAt).toBe(86_400_000 * 3);
+  });
+
+  it('writes the hint when it is missing, even for an unchanged reading', () => {
+    const storage = new MemStorage();
+    const { engine } = makeEngine(makeAdapter({ cached: { active: true, productId: 'p1' } }), { storage });
+    engine.start(); // unlocked from the native cache: applyStatus never ran, no hint yet
+    expect(storage.getItem('glance-billing.last-active')).toBeNull();
+    engine.applyStatus({ active: true, productId: 'p1' });
+    expect(storage.getItem('glance-billing.last-active')).toContain('"p1"');
   });
 });

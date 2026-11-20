@@ -3,9 +3,16 @@
 // info so the JS thread never blocks; the native layer refreshes in the
 // background and self-heals entitlement transfers (syncPurchases) on its own.
 // Purchase/restore outcomes arrive via the shared window event global.
+//
+// Entitlement readings the native layer PUSHES (0.2.4: RevenueCat's
+// PurchasesDelegate reporting updated customer info) arrive via a second
+// global, `window.__billingStatus({active, productId})`, and are applied as
+// status readings, ACTIVE ONLY (see ./statusChannel.ts). A shell that never
+// calls it changes nothing.
 
 import type { ApplyCallbacks, BillingAdapter } from './types.js';
 import type { BillingEvent, Prices, ProductIds, StatusReading, TrialInfo } from '../types.js';
+import { activeOnlyReading } from './statusChannel.js';
 
 /**
  * The subset of the native bridge (`window.<AppName>Native`) used for billing.
@@ -26,6 +33,12 @@ export interface IOSWebViewAdapterOptions {
   bridge: IOSBillingBridge;
   products: ProductIds;
   eventGlobal?: string;
+  /**
+   * Window global the shell calls with a pushed entitlement reading,
+   * `{"active":bool,"productId":string|null}` (object or JSON string). Only an
+   * active reading is ever applied.
+   */
+  statusGlobal?: string;
   timings?: {
     /** Mount: RevenueCat caches status; re-read after this delay so it has
      * had time to refresh from its background network call. */
@@ -39,6 +52,7 @@ type EventWindow = Record<string, unknown>;
 export function createIOSWebViewAdapter(opts: IOSWebViewAdapterOptions): BillingAdapter {
   const { bridge, products } = opts;
   const eventGlobal = opts.eventGlobal ?? '__billingEvent';
+  const statusGlobal = opts.statusGlobal ?? '__billingStatus';
   const mountRereadMs = opts.timings?.mountRereadMs ?? 3000;
   const refreshSettleMs = opts.timings?.refreshSettleMs ?? 2000;
 
@@ -119,7 +133,17 @@ export function createIOSWebViewAdapter(opts: IOSWebViewAdapterOptions): Billing
     bindEvents(apply: ApplyCallbacks): () => void {
       const w = globalThis as EventWindow;
       w[eventGlobal] = (ev: BillingEvent | string) => apply.emitBillingEvent(ev);
-      return () => { delete w[eventGlobal]; };
+      // Pushed readings go to the gate, never through emitBillingEvent: they
+      // are not purchase outcomes, so they must not touch the paywall's event
+      // state, a restore spinner, or an in-flight purchase's timeout.
+      w[statusGlobal] = (update: unknown) => {
+        const reading = activeOnlyReading(update);
+        if (reading) apply.applyStatus(reading);
+      };
+      return () => {
+        delete w[eventGlobal];
+        delete w[statusGlobal];
+      };
     },
   };
 }

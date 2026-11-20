@@ -101,6 +101,12 @@ export interface BillingAdapter {
    * Register the platform's terminal-event channel (window.__billingEvent
    * global, Electron IPC push, Capacitor listener) plus any price-push
    * channels. Returns an unsubscribe function.
+   *
+   * An adapter whose native layer can PUSH entitlement readings (0.2.4: the
+   * iOS adapters, via the 'billingStatus' Capacitor event or the
+   * window.__billingStatus global) also registers that channel here. Pushed
+   * readings go to apply.applyStatus, never emitBillingEvent, and only ACTIVE
+   * ones: a push may rescue an entitlement, never revoke it.
    */
   bindEvents(apply: ApplyCallbacks): () => void;
 

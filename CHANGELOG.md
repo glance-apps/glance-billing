@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.2.4 (2026-11-19)
+
+Three of the iOS post-purchase gaps get their package half: a channel for
+entitlement readings the native layer pushes, a way for `refresh()` to say
+when its work is done, and a purchase outcome that is neither a failure nor a
+confirmation. Nothing changes for an app until its native layer uses them:
+every addition is opt-in, and a shell that sends none of it behaves exactly
+as on 0.2.3.
+
+### Added: pushed status readings, active only
+
+A Capacitor plugin may emit `billingStatus` `{ active, productId }`, and an
+iOS WebView shell may call `window.__billingStatus({ active, productId })`
+(`IOSWebViewAdapterOptions.statusGlobal` renames it). Either is applied
+through the engine's gate as a status reading, so RevenueCat's
+`PurchasesDelegate` can unlock the app the moment an entitlement appears
+outside the purchase flow.
+
+- ACTIVE ONLY, enforced in the package (`activeOnlyReading`): an inactive,
+  indeterminate or malformed push is dropped. A push can rescue an
+  entitlement, never revoke one; see README rule 11 for why (the Mac app can
+  move the entitlement off the iPhone's RevenueCat customer).
+- Pushes go to `applyStatus`, never `emitBillingEvent`: they do not set
+  `billingEvent`, end a restore spinner, or clear a purchase's timeout.
+
+### Added: `refresh()` can report completion (Capacitor)
+
+A plugin whose `initialize()` resolves `{ refreshReportsCompletion: true }`
+has restore and the foreground refresh read when `refresh()` settles, instead
+of `restoreSettleMs` (4000) and `refreshSettleMs` (2000) after the kick. On
+iOS the kick is a RevenueCat fetch and sync whose length nothing bounds, and a
+slow one was read before it finished: Restore told a paying customer "No
+previous purchase found".
+
+- A refresh that never settles is read at `timings.refreshCompletionCapMs`
+  (30 s), below the paywalls' 45 s restore give-up.
+- A rejected refresh is read at once.
+- A plugin that resolves `initialize()` with anything else, the Android one
+  in this package included, keeps the 0.2.3 timers. `test/android-unchanged.test.ts`
+  drives the 0.2.3 adapter and engine (vendored in `test/fixtures`) beside the
+  current ones against an Android-shaped plugin and compares them call for
+  call; the only difference is a listener for `billingStatus`, which Android
+  never sends.
+- The mount sequence is unchanged: still two status reads, at 0 and
+  `mountRereadMs`. The iOS Debug `-GlanceBillingStartLocked` override counts
+  them.
+
+### Added: the `'pending'` purchase outcome
+
+`BillingEventStatus` gains `'pending'`, with two codes outside Play's
+response-code range: `BILLING_CODE_PENDING` (100, deferred: Ask to Buy, extra
+authentication; nothing charged yet) and `BILLING_CODE_UNCONFIRMED` (101, the
+store completed the purchase but the returned entitlement lacks the app's). A
+pending event changes no entitlement in either direction and ends the
+purchase spinner and its timeout like any outcome. `billingErrorMessage` does
+not map them: they are not errors, and the paywall gives them their own copy.
+
+### Changed: a repeated active reading is a no-op
+
+`applyStatus` with the active reading already applied (same product, not
+provisional) no longer notifies subscribers, rewrites the adapter's status
+cache, or rewrites the last-active hint. A purchase now produces a `success`
+event and a pushed reading for the same thing, plus the post-purchase
+re-reads, and each repeat re-rendered the app's root. It still cancels a
+pending downgrade. The hint is still rewritten when it is missing or names
+another product, and on every verification when `offlineGraceDays` is set,
+since that grace is anchored on `verifiedAt`. Observable entitlement
+behavior is unchanged on every platform, Electron included.
+
+### Not changed
+
+The Electron main process and renderer adapter, the Android plugin, the
+post-purchase re-reads, the 12 s downgrade hold and the 60 s purchase
+timeout.
+
 ## 0.2.3 — 2026-11-18
 
 ### Fixed: Electron billing events were lost once the main window was replaced
